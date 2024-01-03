@@ -1,0 +1,191 @@
+#!/usr/bin/env node
+
+var program = require("commander");
+var SerialPort = require("serialport").SerialPort;
+var inquirer = require("inquirer");
+var pkg = require("../package.json");
+var serverMain = require("../index");
+var options = {};
+
+const mqtt = require("mqtt");
+var mqttClient = null;
+
+program
+  .version(pkg.version)
+  .usage("-s <secret> -p <port> -c <pendantport> [options]")
+  .option("-l, --list", "list available ports then exit")
+  .option("-s, --secret", "the secret key stored in the ~/.cncrc file")
+  .option("-p, --port <port>", "path or name of serial port")
+  .option("-c, --pendantport <pendantport>", "path or name of serial port")
+  .option("-b, --baudrate <baudrate>", "baud rate (default: 115200)", 115200)
+  .option(
+    "--socket-address <address>",
+    "socket address or hostname (default: localhost)",
+    "localhost"
+  )
+  .option("--socket-port <port>", "socket port (default: 8000)", 8000)
+  .option(
+    "--controller-type <type>",
+    "controller type: Grbl|Smoothie|TinyG (default: Grbl)",
+    "Grbl"
+  )
+  .option(
+    "--access-token-lifetime <lifetime>",
+    "access token lifetime in seconds or a time span string (default: 30d)",
+    "30d"
+  );
+
+program.parse(process.argv);
+
+var options = {
+  secret: program.secret,
+  port: program.port,
+  baudrate: program.baudrate,
+  socketAddress: program.socketAddress,
+  socketPort: program.socketPort,
+  controllerType: program.controllerType,
+  accessTokenLifetime: program.accessTokenLifetime,
+  list: program.list,
+  pendantPort: program.pendantport,
+};
+
+if (options.list) {
+  SerialPort.list()
+    .then((ports) => {
+      ports.forEach(function (port) {
+        console.log(port.path);
+      });
+    })
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+  return;
+}
+
+var store = {
+  controller: {
+    state: {},
+    settings: {},
+  },
+  sender: {
+    status: {},
+  },
+};
+
+// MQTT broker URL
+const mqttBrokerUrl = "mqtt://" + options.socketAddress;
+
+// MQTT broker credentials
+const mqttUsername = "syn"; // Change this to your MQTT broker username
+const mqttPassword = "sense324"; // Change this to your MQTT broker passwo
+
+function stateData() {
+  return {
+    command: "Grbl:state",
+    wpos_x: store.controller.state.status.wpos.x ?? "0.000",
+    wpos_y: store.controller.state.status.wpos.y ?? "0.000",
+    wpos_z: store.controller.state.status.wpos.z ?? "0.000",
+    mpos_x: store.controller.state.status.mpos.x ?? "0.000",
+    mpos_y: store.controller.state.status.mpos.y ?? "0.000",
+    mpos_z: store.controller.state.status.mpos.z ?? "0.000",
+    activeState: store.controller.state.status.activeState ?? "",
+  };
+}
+
+var createServer = function (options) {
+  serverMain(options, function (err, socket) {
+    // Grbl
+    socket.on("Grbl:state", function (state) {
+      store.controller.state = state;
+      try {
+        mqttClient.publish(MQTT_TOPIC_PUBLISH_TO, JSON.stringify(stateData()) + "\n");
+      } catch (error) {
+        console.log("MQTT Client not found");
+      }
+    });
+
+    socket.on("Grbl:settings", function (settings) {
+      store.controller.settings = settings;
+    });
+
+    // mqtt
+    mqttClient = mqtt.connect(mqttBrokerUrl, {
+      username: mqttUsername,
+      password: mqttPassword,
+    });
+
+    // Define a namespace for your topics
+    const MQTT_TOPIC_PUBLISH_TO = "esp32";
+    const MQTT_TOPIC_RECEIVE_FROM = "cncjs";
+
+    // Handle connection events
+    mqttClient.on("connect", () => {
+      console.log("Connected to MQTT broker");
+
+      // Subscribe to a topic within the namespace
+      mqttClient.subscribe(MQTT_TOPIC_RECEIVE_FROM, (err) => {
+        if (!err) {
+          console.log(`Subscribed to ${MQTT_TOPIC_RECEIVE_FROM}`);
+        }
+      });
+
+      // Publish a cnc state
+      mqttClient.publish(MQTT_TOPIC_PUBLISH_TO, JSON.stringify(stateData()) + "\n");
+    });
+
+    // Handle incoming messages
+    mqttClient.on("message", (topic, message) => {
+      try {
+        const jsonData = JSON.parse(message);
+        console.log('Received JSON:', jsonData);
+        if (jsonData["command" ] == "REQUEST_STATE") {
+          mqttClient.publish(MQTT_TOPIC_PUBLISH_TO, JSON.stringify(stateData()) + "\n");
+        }
+      } catch (error) {
+        console.error('Error parsing JSON:', error.message);
+      }
+    });
+
+    // Handle error events
+    mqttClient.on("error", (err) => {
+      console.error("Error:", err);
+    });
+
+    // Handle disconnection events
+    mqttClient.on("close", () => {
+      console.log("Disconnected from MQTT broker");
+    });
+  });
+};
+
+if (options.port) {
+  createServer(options);
+  return;
+}
+
+SerialPort.list()
+  .then(function (ports) {
+    const choices = ports.map(function (port) {
+      return port.path;
+    });
+
+    inquirer
+      .prompt([
+        {
+          type: "list",
+          name: "port",
+          message: "Specify which port you want to use?",
+          choices: choices,
+        },
+      ])
+      .then(function (answers) {
+        options.port = answers.port;
+
+        createServer(options);
+      });
+  })
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
